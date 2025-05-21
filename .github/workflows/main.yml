@@ -1,4 +1,5 @@
 name: Auto Update Worker
+
 on:
   push:
     branches:
@@ -14,77 +15,68 @@ on:
 
 permissions:
   contents: write
-  actions: read
-  packages: read
-  repository-projects: read
-  security-events: read
-  statuses: read
-  pull-requests: read
-  issues: read
-  metadata: read
 
 jobs:
   update:
     runs-on: ubuntu-latest
     steps:
-      - name: 检出当前仓库
+      - name: 检出仓库
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # 拉取完整历史记录，用于版本对比
 
-      - name: 设置环境变量
+      - name: 设置环境
         run: |
-          echo "REPO_OWNER=bia-pain-bache" >> $GITHUB_ENV
-          echo "REPO_NAME=BPB-Worker-Panel" >> $GITHUB_ENV
-          echo "TARGET_BRANCH=main" >> $GITHUB_ENV # 目标分支，可改为其他分支如master
+          echo "REPO_URL=https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases" >> $GITHUB_ENV
+          echo "TARGET_FILE=worker.zip" >> $GITHUB_ENV
 
-      - name: 获取远程仓库最新信息
+      - name: 检查并更新 Worker
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # 使用 GitHub Token 认证
         run: |
-          git remote add origin-remote https://github.com/${{ env.REPO_OWNER }}/${{ env.REPO_NAME }}.git
-          git fetch origin-remote --depth=1 ${{ env.TARGET_BRANCH }}
-          REMOTE_VERSION=$(git ls-remote --tags origin-remote | grep -oP 'refs/tags/v\K[\d.]+' | sort -V | tail -n1) || true
-          REMOTE_COMMIT=$(git rev-parse origin-remote/${{ env.TARGET_BRANCH }})
-          echo "REMOTE_VERSION=$REMOTE_VERSION" >> $GITHUB_ENV
-          echo "REMOTE_COMMIT=$REMOTE_COMMIT" >> $GITHUB_ENV
+          # 日志函数
+          log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
 
-      - name: 检查本地版本
-        run: |
-          LOCAL_COMMIT=$(git rev-parse HEAD)
-          LOCAL_VERSION=$(cat version.txt 2>/dev/null || echo "0.0.0")
-          echo "LOCAL_VERSION=$LOCAL_VERSION" >> $GITHUB_ENV
-          echo "LOCAL_COMMIT=$LOCAL_COMMIT" >> $GITHUB_ENV
+          log "开始检查更新..."
 
-      - name: 判断是否需要更新
-        run: |
-          FORCE_UPDATE=${{ github.event.inputs.force_update || 'false' }}
-          if [ "$FORCE_UPDATE" == "true" ] || [ "$LOCAL_COMMIT" != "$REMOTE_COMMIT" ]; then
-            echo "需要更新（强制更新或远程有新提交）"
-            exit 0
-          else
-            echo "已是最新版本，无需更新"
+          # 获取本地版本
+          LOCAL_VERSION=$(cat version.txt 2>/dev/null || echo "")
+          log "本地版本: ${LOCAL_VERSION:-无}"
+
+          # 获取最新 Release
+          log "获取最新 Release 信息..."
+          RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$REPO_URL")
+          if [ $? -ne 0 ]; then
+            log "ERROR: 无法访问 GitHub API"
             exit 1
           fi
-        id: need_update
 
-      - name: 克隆或更新远程仓库
-        if: steps.need_update.outcome == 'success'
-        run: |
-          # 克隆或拉取最新代码
-          git clone --depth=1 https://github.com/${{ env.REPO_OWNER }}/${{ env.REPO_NAME }}.git temp-repo
-          cd temp-repo
-          git checkout ${{ env.TARGET_BRANCH }}
-          # 复制目标文件到当前仓库（可根据实际需求修改文件路径）
-          cp -r ./* ../
-          cd ..
-          rm -rf temp-repo
-          # 更新版本号（可选，根据仓库实际版本管理方式调整）
-          CURRENT_VERSION=$(git describe --tags --always 2>/dev/null || echo "unknown")
-          echo "$CURRENT_VERSION" > version.txt
+          TAG_NAME=$(echo "$RESPONSE" | jq -r '.[0].tag_name')
+          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.[0].assets[] | select(.name == "'"$TARGET_FILE"'") | .browser_download_url')
 
-      - name: 提交更新
-        if: steps.need_update.outcome == 'success'
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
+            log "ERROR: 未找到 $TARGET_FILE"
+            exit 1
+          fi
+          log "最新版本: $TAG_NAME"
+
+          # 判断是否需要更新
+          FORCE_UPDATE=${{ github.event.inputs.force_update || 'false' }}
+          if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != "true" ]; then
+            log "已是最新版本，无需更新"
+            exit 0
+          fi
+
+          # 下载并更新
+          log "下载 $TARGET_FILE..."
+          wget -q -O "$TARGET_FILE" "$DOWNLOAD_URL"
+          log "解压 $TARGET_FILE..."
+          unzip -o "$TARGET_FILE"
+          rm "$TARGET_FILE"
+          echo "$TAG_NAME" > version.txt
+          log "更新完成，新版本: $TAG_NAME"
+
+      - name: 提交更改
+        if: success() # 仅在更新成功时提交
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🔄 自动更新仓库代码至 ${REMOTE_VERSION}"
+          commit_message: "🔄 自动同步 Worker 版本: ${{ steps.check_update.outputs.tag_name || '未知' }}"
           commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
-          branch: main # 提交到当前仓库的main分支
